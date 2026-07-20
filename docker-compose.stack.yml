@@ -1,118 +1,72 @@
-# Self-contained variant for stack editors (Portainer / Coolify / Dokploy)
-# where there is no filesystem to mount a config file from.
-#
-# Escaping, the part that bit us twice:
-#
-#   $${VAR}  compose interpolation turns `$$` into a literal `$`, so what
-#            reaches the container is `${VAR}`. The heredoc below is UNQUOTED,
-#            so sh then expands it from the container environment.
-#   \$       WRONG. Inside an unquoted heredoc sh consumes the backslash as an
-#            escape, the `$` stops expanding, and the orphaned backslash lands
-#            in the TOML as `invalid escape character in string`.
-#
-# The surrounding double quotes in `access_key_id = "$${VAR}"` are literal and
-# survive expansion — TOML requires them. A bare value produces
-# `invalid TOML value, did you mean to use a quoted string?`.
-#
-# Credentials come from the environment (a .env file beside this compose, or
-# your stack editor's secrets UI). Nothing secret is committed here.
+version: '3.8'
+  services:
+    greptimedb:
+      image: 'greptime/greptimedb:latest'
+      container_name: greptimedb-r2
+      entrypoint:
+        - /bin/sh
+        - '-c'
+      command:
+        - |
+          cat <<EOF > /tmp/greptime-config.toml
+          data_home = "/data/home"
 
-services:
-  greptimedb:
-    # Pinned, not `latest`: the config schema shifts between releases and a
-    # silent image bump is how a working config starts failing to parse.
-    image: 'greptime/greptimedb:v0.15.2'
-    container_name: greptimedb-r2
-    environment:
-      # `:?` fails fast with a readable message instead of rendering an empty
-      # credential and producing an opaque S3 403 later.
-      R2_ACCESS_KEY_ID: '${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID}'
-      R2_SECRET_ACCESS_KEY: '${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY}'
-      GREPTIME_ADMIN_PW: '${GREPTIME_ADMIN_PW:?set GREPTIME_ADMIN_PW}'
-    entrypoint:
-      - /bin/sh
-      - '-c'
-    command:
-      - |
-        set -eu
-        mkdir -p /data/hot /data/metadata
-        cat <<EOF > /tmp/greptime-config.toml
-        [storage]
-        type = "S3"
-        bucket = "ohlcv"
-        root = "/data"
-        endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
-        region = "auto"
-        access_key_id = "$${R2_ACCESS_KEY_ID}"
-        secret_access_key = "$${R2_SECRET_ACCESS_KEY}"
+          [storage]
+          type = "S3"
+          bucket = "ohlcv"
+          root = "/data"
+          endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
+          access_key_id = "\${R2_ACCESS_KEY_ID}"
+          secret_access_key = "\${R2_SECRET_ACCESS_KEY}"
+          region = "auto"
+          cache_path = "/data/read_cache"
+          cache_capacity = "200GiB"
 
-        # Metadata, WAL and cache live on the mounted volume, not the object store.
-        data_home = "/data/metadata"
+          [storage.http_client]
+          pool_max_idle_per_host = 1024
+          connect_timeout = "5s"
+          timeout = "60s"
 
-        # Local-disk provider for the hot daily-rollup table. Raw minute ticks
-        # stay in R2 (cheap, cold); ohlcv_daily is small and read on every chart
-        # request, so it is pinned to local disk via
-        #   CREATE TABLE ... WITH (storage = 'local_hot')
-        # If this build rejects the block, delete it — the rollup table still
-        # lands in the large write cache below and stays fast.
-        [[storage.providers]]
-        name = "local_hot"
-        type = "File"
-        root = "/data/hot"
+          [wal]
+          provider = "raft_engine"
+          dir = "/data/home/wal"
+          sync_write = false
 
-        [wal]
-        provider = "raft_engine"
-        sync_write = false
+          [[region_engine]]
+          [region_engine.mito]
+          num_workers = 8
+          max_background_jobs = 8
+          enable_write_cache = true
+          write_cache_path = "/data/write_cache"
+          write_cache_size = "20GiB"
+          enable_refill_cache_on_read = true
+          sst_meta_cache_size = "512MiB"
+          vector_cache_size = "1GiB"
+          page_cache_size = "8GiB"
+          selector_result_cache_size = "1GiB"
 
-        [[region_engine]]
-        [region_engine.mito]
-        num_workers = 8
-        max_background_jobs = 8
+          [region_engine.mito.index]
+          aux_path = "/data/home/index"
+          metadata_cache_size = "1GiB"
+          content_cache_size = "8GiB"
+          EOF
 
-        # Unified local read+write cache. The single biggest latency lever:
-        # anything not resident here costs an HTTPS round trip to R2. Size it to
-        # hold the whole compressed dataset — oversizing costs nothing.
-        write_cache_size = "300GiB"
-        write_cache_ttl = "0s"
-        enable_refill_cache_on_read = true
-
-        # In-memory caches — avoid re-decoding parquet pages on repeat reads.
-        page_cache_size = "8GiB"
-        vector_cache_size = "1GiB"
-        sst_meta_cache_size = "512MiB"
-        selector_result_cache_size = "1GiB"
-
-        global_write_buffer_size = "2GiB"
-        global_write_buffer_reject_size = "4GiB"
-
-        [region_engine.mito.index]
-        metadata_cache_size = "1GiB"
-        content_cache_size = "4GiB"
-        EOF
-
-        # Numbered, credential-redacted dump of the generated config. Greptime
-        # reports parse errors as "line N column M" with no context, so without
-        # this every config typo is a guessing game against a crash-looping
-        # container. Redaction keeps the keys out of the log stream.
-        echo "--- rendered config (secrets redacted) ---"
-        sed -E 's/^(access_key_id|secret_access_key)[[:space:]]*=.*/\1 = "[redacted]"/' \
-          /tmp/greptime-config.toml | cat -n
-        echo "--- end config ---"
-
-        exec greptime standalone start -c /tmp/greptime-config.toml \
-          --http-addr 0.0.0.0:4000 \
-          --rpc-addr 0.0.0.0:4001 \
-          --mysql-addr 0.0.0.0:4002 \
-          --postgres-addr 0.0.0.0:4003 \
-          --user-provider=static_user_provider:cmd:admin=$${GREPTIME_ADMIN_PW}
-    ports:
-      - '4000:4000'
-      - '4001:4001'
-      - '4002:4002'
-      - '4003:4003'
-    volumes:
-      - 'greptime-data:/data'
-    restart: unless-stopped
-
-volumes:
-  greptime-data:
+          exec greptime standalone start -c /tmp/greptime-config.toml \
+            --http-addr 0.0.0.0:4000 \
+            --rpc-bind-addr 0.0.0.0:4001 \
+            --mysql-addr 0.0.0.0:4002 \
+            --postgres-addr 0.0.0.0:4003 \
+            --user-provider=static_user_provider:cmd:admin=\${GREPTIME_ADMIN_PASSWORD}
+      env_file: .env
+      ports:
+        - '4000:4000'
+        - '4001:4001'
+        - '4002:4002'
+        - '4003:4003'
+      volumes:
+        - 'greptime-data:/data'
+      ulimits:
+        nofile: 65536
+      restart: unless-stopped
+  volumes:
+    greptime-data: null
