@@ -1,0 +1,36 @@
+services:
+  greptimedb:
+    # Pinned, not `latest`: config schema shifts between releases and a silent
+    # image bump is how a working config starts failing to parse.
+    image: 'greptime/greptimedb:v0.15.2'
+    container_name: greptimedb-r2
+    # No entrypoint override, no heredoc, no shell. The config is a mounted
+    # file, so nothing here needs escaping.
+    command:
+      - standalone
+      - start
+      - '-c'
+      - /etc/greptimedb/config.toml
+      - '--http-addr=0.0.0.0:4000'
+      - '--rpc-addr=0.0.0.0:4001'
+      - '--mysql-addr=0.0.0.0:4002'
+      - '--postgres-addr=0.0.0.0:4003'
+      - '--user-provider=static_user_provider:cmd:admin=${GREPTIME_ADMIN_PW:?set GREPTIME_ADMIN_PW in .env}'
+    ports:
+      - '4000:4000'
+      - '4001:4001'
+      - '4002:4002'
+      - '4003:4003'
+    volumes:
+      - './config.toml:/etc/greptimedb/config.toml:ro'
+      - 'greptime-data:/data'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:4000/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  greptime-data:

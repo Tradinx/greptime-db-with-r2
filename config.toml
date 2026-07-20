@@ -1,0 +1,62 @@
+# GreptimeDB standalone config.
+#
+# Mounted into the container read-only. Deliberately a real file rather than a
+# heredoc inside docker-compose: that path stacked three escaping layers
+# (compose YAML interpolation -> sh heredoc -> TOML) and a single stray
+# backslash produced `invalid escape character in string`. A mounted file has
+# no escaping layers at all.
+#
+# Contains live R2 credentials — gitignored, and should be chmod 600 on the
+# server. See deploy/greptime/README.md.
+
+[storage]
+type = "S3"
+bucket = "ohlcv"
+root = "/data"
+endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
+region = "auto"
+access_key_id = "REPLACE_WITH_ROTATED_R2_ACCESS_KEY_ID"
+secret_access_key = "REPLACE_WITH_ROTATED_R2_SECRET_ACCESS_KEY"
+
+# Metadata, WAL and cache live on the mounted volume, not in the object store.
+data_home = "/data/metadata"
+
+# Local-disk provider for the hot daily-rollup table. Raw minute ticks stay in
+# R2 (cheap, cold); `ohlcv_daily` is small and read on every chart request, so
+# it is pinned to local NVMe via `CREATE TABLE ... WITH (storage = 'local_hot')`.
+# If your GreptimeDB build rejects this block, delete it — the rollup table
+# still lands in the large write cache below and stays fast.
+[[storage.providers]]
+name = "local_hot"
+type = "File"
+root = "/data/hot"
+
+[wal]
+provider = "raft_engine"
+sync_write = false
+
+[[region_engine]]
+[region_engine.mito]
+num_workers = 8
+max_background_jobs = 8
+
+# Unified local read+write cache. This is the single biggest latency lever:
+# anything not resident here costs an HTTPS round trip to Cloudflare R2.
+# Size it to hold the whole compressed dataset — oversizing costs nothing,
+# undersizing costs a network hop per miss.
+write_cache_size = "300GiB"
+write_cache_ttl = "0s"
+enable_refill_cache_on_read = true
+
+# In-memory caches — avoid re-decoding parquet pages on repeat reads.
+page_cache_size = "8GiB"
+vector_cache_size = "1GiB"
+sst_meta_cache_size = "512MiB"
+selector_result_cache_size = "1GiB"
+
+global_write_buffer_size = "2GiB"
+global_write_buffer_reject_size = "4GiB"
+
+[region_engine.mito.index]
+metadata_cache_size = "1GiB"
+content_cache_size = "4GiB"
