@@ -1,15 +1,21 @@
 # Self-contained variant for stack editors (Portainer / Coolify / Dokploy)
 # where there is no filesystem to mount a config file from.
 #
-# The delimiter is QUOTED — <<'EOF', not <<EOF. That makes the heredoc fully
-# literal: sh performs no variable expansion and no backslash processing, so
-# the TOML lands byte-for-byte as written. The earlier `invalid escape
-# character in string` came from an unquoted heredoc, where `\$` was consumed
-# as an escape and the stray backslash leaked into the TOML.
+# Escaping, the part that bit us twice:
 #
-# Consequence of going literal: credentials cannot be injected via ${VAR} here.
-# They are inline below, exactly as in the original stack. ROTATE THEM — the
-# previous pair was pasted into a chat transcript.
+#   $${VAR}  compose interpolation turns `$$` into a literal `$`, so what
+#            reaches the container is `${VAR}`. The heredoc below is UNQUOTED,
+#            so sh then expands it from the container environment.
+#   \$       WRONG. Inside an unquoted heredoc sh consumes the backslash as an
+#            escape, the `$` stops expanding, and the orphaned backslash lands
+#            in the TOML as `invalid escape character in string`.
+#
+# The surrounding double quotes in `access_key_id = "$${VAR}"` are literal and
+# survive expansion — TOML requires them. A bare value produces
+# `invalid TOML value, did you mean to use a quoted string?`.
+#
+# Credentials come from the environment (a .env file beside this compose, or
+# your stack editor's secrets UI). Nothing secret is committed here.
 
 services:
   greptimedb:
@@ -17,22 +23,28 @@ services:
     # silent image bump is how a working config starts failing to parse.
     image: 'greptime/greptimedb:v0.15.2'
     container_name: greptimedb-r2
+    environment:
+      # `:?` fails fast with a readable message instead of rendering an empty
+      # credential and producing an opaque S3 403 later.
+      R2_ACCESS_KEY_ID: '${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID}'
+      R2_SECRET_ACCESS_KEY: '${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY}'
+      GREPTIME_ADMIN_PW: '${GREPTIME_ADMIN_PW:?set GREPTIME_ADMIN_PW}'
     entrypoint:
       - /bin/sh
       - '-c'
     command:
       - |
-        set -e
+        set -eu
         mkdir -p /data/hot /data/metadata
-        cat <<'EOF' > /tmp/greptime-config.toml
+        cat <<EOF > /tmp/greptime-config.toml
         [storage]
         type = "S3"
         bucket = "ohlcv"
         root = "/data"
         endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
         region = "auto"
-        access_key_id = ${R2_ACCESS_KEY_ID}
-        secret_access_key = ${R2_SECRET_ACCESS_KEY}
+        access_key_id = "$${R2_ACCESS_KEY_ID}"
+        secret_access_key = "$${R2_SECRET_ACCESS_KEY}"
 
         # Metadata, WAL and cache live on the mounted volume, not the object store.
         data_home = "/data/metadata"
@@ -78,12 +90,21 @@ services:
         content_cache_size = "4GiB"
         EOF
 
+        # Numbered, credential-redacted dump of the generated config. Greptime
+        # reports parse errors as "line N column M" with no context, so without
+        # this every config typo is a guessing game against a crash-looping
+        # container. Redaction keeps the keys out of the log stream.
+        echo "--- rendered config (secrets redacted) ---"
+        sed -E 's/^(access_key_id|secret_access_key)[[:space:]]*=.*/\1 = "[redacted]"/' \
+          /tmp/greptime-config.toml | cat -n
+        echo "--- end config ---"
+
         exec greptime standalone start -c /tmp/greptime-config.toml \
           --http-addr 0.0.0.0:4000 \
           --rpc-addr 0.0.0.0:4001 \
           --mysql-addr 0.0.0.0:4002 \
           --postgres-addr 0.0.0.0:4003 \
-          --user-provider=static_user_provider:cmd:admin=${GREPTIME_ADMIN_PW}
+          --user-provider=static_user_provider:cmd:admin=$${GREPTIME_ADMIN_PW}
     ports:
       - '4000:4000'
       - '4001:4001'
