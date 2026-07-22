@@ -1,36 +1,69 @@
 services:
   greptimedb:
-    # Pinned, not `latest`: config schema shifts between releases and a silent
-    # image bump is how a working config starts failing to parse.
-    image: 'greptime/greptimedb:v0.15.2'
+    # Pinned, never `latest`: config keys and CLI flags shift between releases.
+    # A silent image bump is how a working deployment starts failing to boot.
+    image: greptime/greptimedb:v1.1.3
     container_name: greptimedb-r2
-    # No entrypoint override, no heredoc, no shell. The config is a mounted
-    # file, so nothing here needs escaping.
+
+    # No entrypoint override, no shell, no heredoc. The config is a mounted
+    # file, so there is nothing to escape.
+    #
+    # NOTE: v1.x renamed the gRPC flag to --grpc-bind-addr. --rpc-bind-addr
+    # does not exist and makes the process exit on startup.
     command:
       - standalone
       - start
-      - '-c'
-      - /etc/greptimedb/config.toml
-      - '--http-addr=0.0.0.0:4000'
-      - '--rpc-addr=0.0.0.0:4001'
-      - '--mysql-addr=0.0.0.0:4002'
-      - '--postgres-addr=0.0.0.0:4003'
-      - '--user-provider=static_user_provider:cmd:admin=${GREPTIME_ADMIN_PW:?set GREPTIME_ADMIN_PW in .env}'
+      - --config-file=/etc/greptimedb/config.toml
+      - --http-addr=0.0.0.0:4000
+      - --grpc-bind-addr=0.0.0.0:4001
+      - --mysql-addr=0.0.0.0:4002
+      - --postgres-addr=0.0.0.0:4003
+      - --user-provider=static_user_provider:cmd:admin=${GREPTIME_ADMIN_PASSWORD:?set GREPTIME_ADMIN_PASSWORD in .env}
+
+    environment:
+      # Merged over config.toml by GreptimeDB itself. Keeps secrets out of git.
+      GREPTIMEDB_STANDALONE__STORAGE__ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID in .env}
+      GREPTIMEDB_STANDALONE__STORAGE__SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY in .env}
+
     ports:
-      - '4000:4000'
-      - '4001:4001'
-      - '4002:4002'
-      - '4003:4003'
+      # Defaults to 0.0.0.0. Set BIND_HOST=127.0.0.1 in .env and front it with a
+      # reverse proxy if the host is internet-facing.
+      - '${BIND_HOST:-0.0.0.0}:4000:4000'  # HTTP / dashboard
+      - '${BIND_HOST:-0.0.0.0}:4001:4001'  # gRPC
+      - '${BIND_HOST:-0.0.0.0}:4002:4002'  # MySQL wire protocol
+      - '${BIND_HOST:-0.0.0.0}:4003:4003'  # PostgreSQL wire protocol
+
     volumes:
-      - './config.toml:/etc/greptimedb/config.toml:ro'
-      - 'greptime-data:/data'
+      - ./config.toml:/etc/greptimedb/config.toml:ro
+      - greptime-data:/data
+
+    ulimits:
+      # Object-store reads plus 1024 idle connections per host chew through fds.
+      nofile:
+        soft: 65536
+        hard: 65536
+
     restart: unless-stopped
+
+    # 32 GB host: cap the container so a runaway query kills the container
+    # instead of the host. GreptimeDB reads the cgroup limit and sizes its
+    # internal runtime from it, so this is also a correctness signal, not just
+    # a safety net.
+    mem_limit: 26g
+
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:4000/health']
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 60s
+      # Cold start has to reach R2 and open the WAL; do not fail it early.
+      start_period: 90s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: '5'
 
 volumes:
   greptime-data:

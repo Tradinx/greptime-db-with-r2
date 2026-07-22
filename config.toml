@@ -1,62 +1,85 @@
-# GreptimeDB standalone config.
+# GreptimeDB standalone configuration.
 #
-# Mounted into the container read-only. Deliberately a real file rather than a
-# heredoc inside docker-compose: that path stacked three escaping layers
-# (compose YAML interpolation -> sh heredoc -> TOML) and a single stray
-# backslash produced `invalid escape character in string`. A mounted file has
-# no escaping layers at all.
+# Mounted read-only into the container at /etc/greptimedb/config.toml.
 #
-# Contains live R2 credentials — gitignored, and should be chmod 600 on the
-# server. See deploy/greptime/README.md.
+# NO SECRETS IN THIS FILE. R2 credentials are injected at runtime as
+# environment variables, which GreptimeDB merges over this file:
+#
+#   GREPTIMEDB_STANDALONE__STORAGE__ACCESS_KEY_ID
+#   GREPTIMEDB_STANDALONE__STORAGE__SECRET_ACCESS_KEY
+#
+# Format is GREPTIMEDB_STANDALONE__<SECTION>__<KEY>, double underscore between
+# levels. See .env.example.
+
+# Metadata, WAL and local caches live on the mounted volume, not in R2.
+data_home = "/data/home"
 
 [storage]
 type = "S3"
 bucket = "ohlcv"
 root = "/data"
 endpoint = "https://1c0536c91a38db1b8f5607f69c452b27.r2.cloudflarestorage.com"
+# R2 has no regions, but the S3 client requires the field set.
 region = "auto"
-access_key_id = "REPLACE_WITH_ROTATED_R2_ACCESS_KEY_ID"
-secret_access_key = "REPLACE_WITH_ROTATED_R2_SECRET_ACCESS_KEY"
 
-# Metadata, WAL and cache live on the mounted volume, not in the object store.
-data_home = "/data/metadata"
+# Local read cache. Every miss here is an HTTPS round trip to Cloudflare, so
+# size it to hold the working set.
+#
+# Sized for a 320 GB local disk (16 vCPU / 32 GB RAM host). Disk budget:
+#   read cache 150 + write cache 20 + WAL/metadata/index ~20 = ~190 GiB
+# leaving room for the OS, Docker images and log growth. The named volume
+# lives on the 320 GB local disk; if you bind /data to the 40 GB block volume
+# instead, drop this to ~20GiB or the cache will fill the disk.
+cache_path = "/data/read_cache"
+cache_capacity = "150GiB"
 
-# Local-disk provider for the hot daily-rollup table. Raw minute ticks stay in
-# R2 (cheap, cold); `ohlcv_daily` is small and read on every chart request, so
-# it is pinned to local NVMe via `CREATE TABLE ... WITH (storage = 'local_hot')`.
-# If your GreptimeDB build rejects this block, delete it — the rollup table
-# still lands in the large write cache below and stays fast.
-[[storage.providers]]
-name = "local_hot"
-type = "File"
-root = "/data/hot"
+[storage.http_client]
+pool_max_idle_per_host = 1024
+# 10s: Cloudflare edge routing can make the initial TLS handshake slow
+# depending on geography. 5s produced spurious connect failures.
+connect_timeout = "10s"
+# 120s: a large chunk pull from R2, or a fetch competing with local decompression
+# for CPU, can legitimately exceed 60s. The old 60s cap was killing healthy but
+# slow downloads and surfacing as reqwest::Error.
+timeout = "120s"
 
 [wal]
 provider = "raft_engine"
+dir = "/data/home/wal"
+# false = ack writes before fsync. Faster, but a host crash can lose the last
+# few writes. Set true if that is unacceptable.
 sync_write = false
 
 [[region_engine]]
 [region_engine.mito]
+# 16 vCPU host. Workers handle writes/flush; background jobs handle compaction.
 num_workers = 8
 max_background_jobs = 8
 
-# Unified local read+write cache. This is the single biggest latency lever:
-# anything not resident here costs an HTTPS round trip to Cloudflare R2.
-# Size it to hold the whole compressed dataset — oversizing costs nothing,
-# undersizing costs a network hop per miss.
-write_cache_size = "300GiB"
-write_cache_ttl = "0s"
+# Write cache: newly flushed SSTs stay on local disk instead of being re-read
+# from R2 on the next query.
+enable_write_cache = true
+write_cache_path = "/data/write_cache"
+write_cache_size = "20GiB"
 enable_refill_cache_on_read = true
 
 # In-memory caches — avoid re-decoding parquet pages on repeat reads.
-page_cache_size = "8GiB"
-vector_cache_size = "1GiB"
-sst_meta_cache_size = "512MiB"
-selector_result_cache_size = "1GiB"
+#
+# RAM budget on a 32 GB host. These are additive and this process is not the
+# only consumer:
+#   page 6 + content 3 + write buffer 2 + vector/selector/meta/index ~1.75
+#   = ~12.75 GiB steady state, ~19 GB left for OS page cache, query working
+#   memory and burst. Raise page_cache_size first if queries are read-heavy.
+sst_meta_cache_size = "256MiB"
+vector_cache_size = "512MiB"
+page_cache_size = "6GiB"
+selector_result_cache_size = "512MiB"
 
+# Reject writes before the host OOMs rather than after.
 global_write_buffer_size = "2GiB"
 global_write_buffer_reject_size = "4GiB"
 
 [region_engine.mito.index]
-metadata_cache_size = "1GiB"
-content_cache_size = "4GiB"
+aux_path = "/data/home/index"
+metadata_cache_size = "512MiB"
+content_cache_size = "3GiB"
