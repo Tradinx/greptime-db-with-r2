@@ -8,12 +8,22 @@ services:
     # No entrypoint override, no shell, no heredoc. The config is a mounted
     # file, so there is nothing to escape.
     #
-    # NOTE: v1.x renamed the gRPC flag to --grpc-bind-addr. --rpc-bind-addr
-    # does not exist and makes the process exit on startup.
+    # --grpc-bind-addr is the documented flag in v1.1.3 (the only one `--help`
+    # lists). --rpc-bind-addr still works as an undocumented alias; prefer the
+    # documented name so a future release dropping the alias cannot break boot.
     command:
       - standalone
       - start
       - --config-file=/etc/greptimedb/config.toml
+      # CRITICAL: without this, data_home resolves to the RELATIVE default
+      # ./greptimedb_data, putting the metadata KV backend (the table catalog)
+      # on the container's ephemeral writable layer instead of the volume.
+      # The catalog then survives stop/start but is DESTROYED on every
+      # container recreate, leaving a full R2 bucket with zero tables.
+      # The `data_home` key in config.toml is NOT honoured in v1.1.3 — verified
+      # from the startup dump, which showed `data_home: "./greptimedb_data"`
+      # while the file said "/data/home". The CLI flag is authoritative.
+      - --data-home=/data/home
       - --http-addr=0.0.0.0:4000
       - --grpc-bind-addr=0.0.0.0:4001
       - --mysql-addr=0.0.0.0:4002
@@ -67,3 +77,14 @@ services:
 
 volumes:
   greptime-data:
+    # Pinned name. WITHOUT this, Compose prefixes the volume with the project
+    # name (e.g. services-greptime-db-v1qbnz_greptime-data). Any project rename
+    # or PaaS redeploy under a new generated slug then mints an EMPTY volume —
+    # and because the table catalog lives in ./home/wal/*.raftlog and nowhere
+    # else, the DB comes up with zero tables while every byte in R2 sits
+    # unreadable. That exact failure happened on 2026-07-22.
+    #
+    # `name:` (not `external: true`) is deliberate: it reuses the volume if it
+    # exists and creates it if it does not, instead of hard-failing on a fresh
+    # host.
+    name: greptime-data

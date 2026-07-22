@@ -79,10 +79,54 @@ Memory: ~12.75 GiB steady state across page/content/vector caches and write
 buffers, container capped at 26 GB via `mem_limit`. Tune `page_cache_size`
 first if the workload is read-heavy.
 
+## R2 is not a backup — read this before touching the volume
+
+The `greptime-data` volume is **not** just cache, even though ~99% of its bytes
+are:
+
+| Path | Contents | If lost |
+| --- | --- | --- |
+| `home/wal/*.raftlog` | **WAL + table catalog / region metadata** (~70 MB) | 🔴 R2 data becomes unreadable |
+| `home/index/` | index staging | regenerates |
+| `write_cache/` | cached SSTs (GBs) | regenerates from R2 |
+| `read_cache/` | read cache (GBs) | regenerates from R2 |
+
+R2 stores SST files keyed by table and region ID. The mapping from a table
+*name* to those IDs exists only in the local raft-engine WAL. Start GreptimeDB
+against a full R2 bucket with an empty volume and you get **zero tables** — the
+data is intact and unaddressable.
+
+This is not theoretical. On 2026-07-22 a redeploy under a new Dokploy project
+slug created a fresh empty volume; the database came up with no tables while
+every byte remained in R2. Recovery was copying `home/` back from the old
+volume.
+
+Two defences, both already in this repo:
+
+1. The volume name is **pinned** (`name: greptime-data`), so a project rename
+   cannot silently swap in an empty volume.
+2. `scripts/backup-metadata.sh` archives `home/` (~70 MB). Run it on a cron:
+
+   ```sh
+   0 */6 * * * /path/to/scripts/backup-metadata.sh /root/greptime-backups
+   ```
+
+Restoring metadata into a volume:
+
+```sh
+docker compose stop greptimedb
+docker run --rm -v greptime-data:/data -v /root/greptime-backups:/b:ro \
+  alpine sh -c 'rm -rf /data/home && tar xzf /b/greptime-home-YYYYMMDD-HHMMSS.tar.gz -C /data'
+docker compose start greptimedb
+```
+
 ## Notable gotchas
 
-- **`--grpc-bind-addr`, not `--rpc-bind-addr`.** v1.x renamed the flag. The old
-  name makes the process exit immediately at startup.
+- **Prefer `--grpc-bind-addr`.** It is the only gRPC flag `standalone start
+  --help` lists in v1.1.3. `--rpc-bind-addr` still works as an undocumented
+  alias, so existing configs using it are not broken — but an alias that is
+  already absent from `--help` is a reasonable candidate for removal, so use
+  the documented name.
 - **Config is a mounted file, not a heredoc.** Generating the TOML inside a
   shell heredoc in `command:` stacks three escaping layers (compose
   interpolation → `sh` → TOML); one stray backslash yields

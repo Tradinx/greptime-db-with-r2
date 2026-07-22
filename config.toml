@@ -12,6 +12,12 @@
 # levels. See .env.example.
 
 # Metadata, WAL and local caches live on the mounted volume, not in R2.
+#
+# WARNING: this key is IGNORED by v1.1.3. The startup options dump shows
+# `data_home: "./greptimedb_data"` regardless of what is set here. data_home is
+# passed via the --data-home CLI flag in docker-compose.yml instead; that is the
+# only form that takes effect. Left here for documentation only — do not rely
+# on it, and do not remove the CLI flag.
 data_home = "/data/home"
 
 [storage]
